@@ -18,17 +18,38 @@ use super::{RouteSelector, ExecutionEngine};
 use crate::router::routes::RouteSelection;
 use crate::router::execution::{ExecutionResult, ExecutionStats};
 use crate::router::selector::LatencyStats;
-use anyhow::Result;
+use crate::control::{AdmissionControl, CircuitBreakers};
+use crate::router::validation::validate_limit_order;
+use anyhow::{Result, Context};
+use tracing::{warn, error};
 
 /// High-level Router that ties selection and execution together
 pub struct Router {
     selector: Arc<RouteSelector>,
     executor: Arc<ExecutionEngine>,
+    admission: Option<Arc<AdmissionControl>>,
+    breakers: Option<Arc<CircuitBreakers>>,
 }
 
 impl Router {
     pub fn new(selector: Arc<RouteSelector>, executor: Arc<ExecutionEngine>) -> Self {
-        Self { selector, executor }
+        Self { 
+            selector, 
+            executor,
+            admission: None,
+            breakers: None,
+        }
+    }
+
+    /// Set admission control and circuit breakers
+    pub fn with_control(
+        mut self,
+        admission: Arc<AdmissionControl>,
+        breakers: Arc<CircuitBreakers>,
+    ) -> Self {
+        self.admission = Some(admission);
+        self.breakers = Some(breakers);
+        self
     }
 
     /// Get access to the route selector (for operations like updating latency estimates)
@@ -43,21 +64,55 @@ impl Router {
 
     /// Route a single DeepBook limit order request and execute it
     pub async fn execute_limit_order(&self, req: &LimitReq) -> Result<ExecutionResult> {
+        // 1. Acquire admission control permit
+        let _permit = if let Some(admission) = &self.admission {
+            Some(admission.acquire().await)
+        } else {
+            None
+        };
+
+        // 2. Pre-trade validation
+        if let Some(adapter) = self.selector.deepbook_adapter() {
+            let validation = validate_limit_order(adapter, req).await?;
+            validation.into_result()
+                .context("pre-trade validation failed")?;
+        }
+
+        // 3. Select route
         let sel = self.selector.select_route(req).await?;
         let best = sel.best_plan().clone();
         let uses_shared = best.uses_shared_objects;
         
-        match self.executor.execute(&best).await {
+        // 4. Check circuit breaker for route class
+        let route_class = format!("{:?}", best.route);
+        if let Some(breakers) = &self.breakers {
+            if breakers.is_open(&route_class).await {
+                anyhow::bail!("circuit breaker open for route class: {}", route_class);
+            }
+        }
+
+        // 5. Execute route
+        let result = match self.executor.execute(&best).await {
             Ok(result) => {
+                // Record success in circuit breaker
+                if let Some(breakers) = &self.breakers {
+                    breakers.record_success(&route_class).await;
+                }
                 // Record latency observation for adaptive updates
                 self.selector.record_latency(result.effects_time_ms, uses_shared).await;
                 Ok(result)
             }
             Err(e) => {
+                // Record failure in circuit breaker
+                if let Some(breakers) = &self.breakers {
+                    breakers.record_failure(&route_class).await;
+                }
                 // Execution failed - this is already tracked in ExecutionEngine stats
                 Err(e)
             }
-        }
+        };
+
+        result
     }
 
     /// Select route without executing (for quote/preview)

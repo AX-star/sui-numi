@@ -141,12 +141,16 @@ async fn run() -> Result<()> {
 
     let execution_engine = Arc::new(execution_engine);
 
+    // Initialize control plane
+    let admission = Arc::new(AdmissionControl::new(config.max_inflight, None));
+    let breakers = Arc::new(CircuitBreakers::new());
+
     // Create Router instance for order execution
     let route_selector_arc = Arc::new(route_selector);
     let router = Arc::new(Router::new(
         route_selector_arc.clone(),
         execution_engine.clone(),
-    ));
+    ).with_control(admission.clone(), breakers.clone()));
 
     let app = App {
         config: Arc::new(config),
@@ -234,11 +238,7 @@ impl App {
             );
         }
 
-        // Initialize control plane
-        let admission = AdmissionControl::new(self.config.max_inflight, None);
-        let breakers = CircuitBreakers::new();
-        self.admission = Some(admission.clone());
-        self.breakers = Some(breakers.clone());
+        // Control plane is now initialized in main() and passed to Router
 
         // Start checkpoint streaming and reconciliation
         let checkpoint_state = CheckpointState::new(1024);

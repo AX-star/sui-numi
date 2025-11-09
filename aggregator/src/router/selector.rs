@@ -46,6 +46,11 @@ impl RouteSelector {
         }
     }
 
+    /// Get the DeepBook adapter if available
+    pub fn deepbook_adapter(&self) -> Option<&Arc<DeepBookAdapter>> {
+        self.deepbook.as_ref()
+    }
+
     /// Record an observed execution latency
     /// This is called after execution completes to update latency estimates
     pub async fn record_latency(&self, latency_ms: f64, uses_shared_objects: bool) {

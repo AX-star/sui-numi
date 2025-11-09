@@ -14,7 +14,8 @@ pub enum Route {
     /// Multi-venue split route (e.g., DeepBook + AMM)
     MultiVenueSplit {
         deepbook: Option<LimitReq>,
-        // Future: AMM routes, flash loans, etc.
+        // Future: AMM routes will be added here when AMM adapters are implemented
+        // amm_swap: Option<AmmSwapReq>,
     },
     /// Cancel and replace chain
     CancelReplace {

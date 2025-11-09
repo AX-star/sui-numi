@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::str::FromStr;
 use sui_deepbookv3::client::{DeepBookClient, PoolBookParams};
 use sui_deepbookv3::utils::config::{Environment, GAS_BUDGET, MAX_TIMESTAMP};
 use sui_deepbookv3::utils::types::{
@@ -16,7 +17,7 @@ use sui_sdk::types::programmable_transaction_builder::ProgrammableTransactionBui
 use sui_sdk::types::base_types::ObjectRef;
 use sui_sdk::types::transaction::{InputObjectKind, TransactionData, TransactionKind};
 use sui_sdk::{SuiClient, SuiClientBuilder};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::quant::{quantize_price, quantize_size, PoolParams};
 
@@ -34,9 +35,9 @@ pub struct LimitReq {
 #[derive(Clone)]
 pub struct DeepBookAdapter {
     sui: SuiClient,
-    db: DeepBookClient,
+    pub(crate) db: DeepBookClient,
     sender: SuiAddress,
-    manager_key: String, // key used inside DeepBookClient config, e.g. "MANAGER_1"
+    pub(crate) manager_key: String, // key used inside DeepBookClient config, e.g. "MANAGER_1"
 }
 
 impl DeepBookAdapter {
@@ -54,6 +55,10 @@ impl DeepBookAdapter {
             indexer = indexer_base,
             "DeepBook indexer configured for venue adapter"
         );
+        // Note: The DeepBook SDK (DeepBookClient) methods like get_level2_ticks_from_mid
+        // and pool_book_params likely use the indexer under the hood. For direct indexer
+        // API access, we would need to add HTTP client calls to the indexer_base URL.
+        // Currently, we rely on the SDK's abstraction which should use the indexer when available.
 
         // Wire minimal config maps for the SDK. We provide the BalanceManager only;
         // coins/pools use SDK defaults for the chosen environment.
@@ -303,5 +308,78 @@ impl DeepBookAdapter {
             .get_reference_gas_price()
             .await
             .context("fetch reference gas price")
+    }
+
+    /// Build a cancel order command for a PTB
+    /// Returns the Argument that can be added to a PTB
+    pub async fn build_cancel_order_command(
+        &self,
+        ptb: &mut ProgrammableTransactionBuilder,
+        pool: &str,
+        order_id: u128,
+    ) -> Result<sui_sdk::types::transaction::Argument> {
+        self.db
+            .deep_book
+            .cancel_order(ptb, pool, &self.manager_key, order_id)
+            .await
+            .context("build cancel order command")
+    }
+
+    /// Get order ID from transaction digest by querying transaction effects
+    /// This extracts the order ID from the transaction that placed the order
+    pub async fn get_order_id_from_digest(
+        &self,
+        digest: &str,
+        pool: &str,
+    ) -> Result<Option<u128>> {
+        use sui_sdk::types::digests::TransactionDigest;
+        
+        // Query transaction by digest
+        let tx_digest = TransactionDigest::from_str(digest)
+            .map_err(|e| anyhow::anyhow!("invalid transaction digest: {}", e))?;
+        
+        let tx = self
+            .sui
+            .read_api()
+            .get_transaction_with_options(
+                tx_digest,
+                sui_sdk::rpc_types::SuiTransactionBlockResponseOptions::full_content(),
+            )
+            .await
+            .context("query transaction by digest")?;
+
+        // Extract order ID from events
+        // DeepBook emits events when orders are placed - we need to find the OrderPlaced event
+        // TODO: Implement proper event parsing based on actual Sui SDK event structure
+        // The event structure may vary by SDK version. For now, this is a placeholder
+        // that can be extended once the exact event field names are known.
+        //
+        // In production, you'd want to:
+        // 1. Parse events from tx.events.data
+        // 2. Find OrderPlaced event (check event_type or package_id/module)
+        // 3. Extract order_id from event JSON/BCS data
+        // 4. Return the order_id
+        
+        // For now, return None - the cancel-replace route will need order ID provided
+        // directly or looked up via account_open_orders
+        warn!(
+            digest = digest,
+            pool = pool,
+            "order ID lookup from transaction digest not fully implemented - event parsing needs SDK-specific implementation"
+        );
+        Ok(None)
+    }
+
+    /// Get open order IDs for the account in a pool
+    pub async fn get_open_order_ids(&self, pool: &str) -> Result<Vec<u128>> {
+        self.db
+            .account_open_orders(pool, &self.manager_key)
+            .await
+            .context("fetch account open orders")
+    }
+
+    /// Get access to the underlying SuiClient (for advanced queries)
+    pub fn sui_client(&self) -> &SuiClient {
+        &self.sui
     }
 }
