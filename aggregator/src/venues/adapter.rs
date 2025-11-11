@@ -259,6 +259,18 @@ impl DeepBookAdapter {
         })
     }
 
+    pub async fn balance_manager_balances(&self, pool: &str) -> Result<(f64, f64, f64)> {
+        let account = self
+            .db
+            .account(pool, &self.manager_key)
+            .await
+            .with_context(|| format!("fetch balance manager account for {pool}"))?;
+        let net_base = (account.settled_balances.base - account.owed_balances.base).max(0.0);
+        let net_quote = (account.settled_balances.quote - account.owed_balances.quote).max(0.0);
+        let net_deep = (account.settled_balances.deep - account.owed_balances.deep).max(0.0);
+        Ok((net_base, net_quote, net_deep))
+    }
+
     /// Get mid price for a pool
     pub async fn mid_price(&self, pool: &str) -> Result<f64> {
         self.db

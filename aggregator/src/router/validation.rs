@@ -3,7 +3,6 @@
 //
 // Numan Thabit 2025 Nov
 
-use crate::quant::PoolParams;
 use crate::venues::adapter::{DeepBookAdapter, LimitReq};
 use anyhow::Result;
 use tracing::warn;
@@ -37,12 +36,20 @@ impl ValidationResult {
     }
 }
 
+impl Default for ValidationResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Validate a limit order request before routing/execution
 pub async fn validate_limit_order(
     adapter: &DeepBookAdapter,
     req: &LimitReq,
 ) -> Result<ValidationResult> {
     let mut result = ValidationResult::new();
+    let mut quantized_price = None;
+    let mut quantized_size = None;
 
     // 1. Validate pool parameters exist
     let pool_params = match adapter.pool_params(&req.pool).await {
@@ -55,11 +62,12 @@ pub async fn validate_limit_order(
 
     // 2. Validate quantization (price and size meet tick/lot/min constraints)
     match crate::quant::quantize_price(req.price, pool_params.tick_size) {
-        Ok(quantized_price) => {
-            if (quantized_price - req.price).abs() / req.price > 0.001 {
+        Ok(price) => {
+            quantized_price = Some(price);
+            if (price - req.price).abs() / req.price > 0.001 {
                 warn!(
                     original_price = req.price,
-                    quantized_price = quantized_price,
+                    quantized_price = price,
                     "price was quantized significantly"
                 );
             }
@@ -70,17 +78,18 @@ pub async fn validate_limit_order(
     }
 
     match crate::quant::quantize_size(req.quantity, pool_params.lot_size, pool_params.min_size) {
-        Ok(quantized_size) => {
-            if quantized_size < pool_params.min_size {
+        Ok(size) => {
+            quantized_size = Some(size);
+            if size < pool_params.min_size {
                 result.add_error(format!(
                     "quantized size {} is below minimum size {}",
-                    quantized_size, pool_params.min_size
+                    size, pool_params.min_size
                 ));
             }
-            if (quantized_size - req.quantity).abs() / req.quantity > 0.001 {
+            if (size - req.quantity).abs() / req.quantity > 0.001 {
                 warn!(
                     original_quantity = req.quantity,
-                    quantized_quantity = quantized_size,
+                    quantized_quantity = size,
                     "quantity was quantized significantly"
                 );
             }
@@ -98,28 +107,63 @@ pub async fn validate_limit_order(
 
     // TODO: Add actual balance check once we have pool coin types
     // For DeepBook, we can use the adapter's DeepBookClient to check balance
+    if let (Some(q_price), Some(q_size)) = (quantized_price, quantized_size) {
+        if let Some(err) = validate_balance_manager_funding(adapter, req, q_price, q_size).await? {
+            result.add_error(err);
+        }
+    }
 
     Ok(result)
 }
 
 /// Validate BalanceManager has sufficient balance for an order
 pub async fn validate_balance_manager_funding(
-    _adapter: &DeepBookAdapter,
-    _req: &LimitReq,
-    _pool_params: &PoolParams,
-) -> Result<ValidationResult> {
-    let result = ValidationResult::new();
+    adapter: &DeepBookAdapter,
+    req: &LimitReq,
+    quantized_price: f64,
+    quantized_size: f64,
+) -> Result<Option<String>> {
+    let (net_base, net_quote, net_deep) = match adapter.balance_manager_balances(&req.pool).await {
+        Ok(balances) => balances,
+        Err(e) => {
+            return Ok(Some(format!(
+                "failed to fetch balance manager balances: {}",
+                e
+            )))
+        }
+    };
 
-    // Determine required coin type based on order side
-    // For bids: need quote coin
-    // For asks: need base coin
-    // Note: This is a simplified check - in production, you'd need to:
-    // 1. Get pool's base_coin and quote_coin types
-    // 2. Calculate required amount (price * quantity for bids, quantity for asks)
-    // 3. Check BalanceManager balance for that coin type
+    if req.is_bid {
+        let taker_fee_multiplier = match adapter.trade_params(&req.pool).await {
+            Ok(params) => 1.0 + params.taker_fee,
+            Err(e) => {
+                return Ok(Some(format!(
+                    "failed to fetch trade params for pool {}: {}",
+                    req.pool, e
+                )))
+            }
+        };
+        let required_quote = quantized_price * quantized_size * taker_fee_multiplier;
+        if net_quote + f64::EPSILON < required_quote {
+            return Ok(Some(format!(
+                "insufficient quote balance: requires {:.6}, available {:.6}",
+                required_quote, net_quote
+            )));
+        }
+        if req.pay_with_deep && net_deep <= 0.0 {
+            return Ok(Some(
+                "pay_with_deep set but BalanceManager has no DEEP balance".to_string(),
+            ));
+        }
+    } else {
+        let required_base = quantized_size;
+        if net_base + f64::EPSILON < required_base {
+            return Ok(Some(format!(
+                "insufficient base balance: requires {:.6}, available {:.6}",
+                required_base, net_base
+            )));
+        }
+    }
 
-    // Placeholder: We'll add this once we have access to pool coin types
-    // For now, return valid to avoid blocking execution
-
-    Ok(result)
+    Ok(None)
 }

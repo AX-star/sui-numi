@@ -5,17 +5,24 @@
 
 use crate::venues::adapter::LimitReq;
 use axum::{
+    body::Body,
     extract::State,
-    http::StatusCode,
-    response::Json,
+    http::{HeaderMap, StatusCode},
+    response::{Html, Json, Response},
     routing::{get, post},
     Router as AxumRouter,
 };
+use prometheus::{Encoder, TextEncoder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use tracing::{field, info_span};
 
 use super::{ExecutionEngine, RouteSelector};
 use crate::control::{AdmissionControl, CircuitBreakers};
+use crate::metrics::{REQ_ERRORS, REQ_LATENCY};
 use crate::router::execution::{ExecutionResult, ExecutionStats};
 use crate::router::routes::RouteSelection;
 use crate::router::selector::LatencyStats;
@@ -28,6 +35,8 @@ pub struct Router {
     executor: Arc<ExecutionEngine>,
     admission: Option<Arc<AdmissionControl>>,
     breakers: Option<Arc<CircuitBreakers>>,
+    idempotency: Arc<RwLock<HashMap<String, IdemEntry>>>,
+    idem_ttl: Duration,
 }
 
 impl Router {
@@ -37,6 +46,8 @@ impl Router {
             executor,
             admission: None,
             breakers: None,
+            idempotency: Arc::new(RwLock::new(HashMap::new())),
+            idem_ttl: Duration::from_secs(300),
         }
     }
 
@@ -59,6 +70,27 @@ impl Router {
     /// Get access to the execution engine (for operations like setting sponsorship)
     pub fn executor(&self) -> &Arc<ExecutionEngine> {
         &self.executor
+    }
+
+    async fn idem_get(&self, key: &str) -> Option<LimitOrderResponse> {
+        let guard = self.idempotency.read().await;
+        if let Some(entry) = guard.get(key) {
+            if entry.at.elapsed() < self.idem_ttl {
+                return Some(entry.response.clone());
+            }
+        }
+        None
+    }
+
+    async fn idem_put(&self, key: String, response: LimitOrderResponse) {
+        let mut guard = self.idempotency.write().await;
+        guard.insert(
+            key,
+            IdemEntry {
+                at: Instant::now(),
+                response,
+            },
+        );
     }
 
     /// Route a single DeepBook limit order request and execute it
@@ -123,6 +155,12 @@ impl Router {
     }
 }
 
+#[derive(Clone)]
+struct IdemEntry {
+    at: Instant,
+    response: LimitOrderResponse,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LimitOrderRequest {
     pub pool: String,
@@ -134,7 +172,7 @@ pub struct LimitOrderRequest {
     pub expiration_ms: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct LimitOrderResponse {
     pub digest: String,
     pub effects_time_ms: f64,
@@ -162,14 +200,20 @@ pub struct RoutePlanResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Create the HTTP router with API endpoints
 pub fn create_api_router(router: Arc<Router>) -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health_check))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(swagger_ui))
+        .route("/metrics", get(metrics_endpoint))
         .route("/api/v1/quote", post(quote_route))
         .route("/api/v1/order", post(execute_order))
         .route("/api/v1/stats", get(get_stats))
@@ -183,11 +227,125 @@ async fn health_check() -> StatusCode {
     StatusCode::OK
 }
 
+/// Serve OpenAPI spec from a bundled JSON file
+async fn openapi_json() -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let spec_str = include_str!("../../openapi/openapi.json");
+    let json: serde_json::Value = serde_json::from_str(spec_str).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                code: "OPENAPI_PARSE".to_string(),
+                message: format!("failed to parse openapi spec: {}", e),
+                details: None,
+            }),
+        )
+    })?;
+    Ok(Json(json))
+}
+
+/// Serve Swagger UI backed by /openapi.json
+async fn swagger_ui() -> Html<&'static str> {
+    static HTML: &str = r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ultra Aggregator API Docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+    <script>
+      window.onload = () => {
+        window.ui = SwaggerUIBundle({
+          url: '/openapi.json',
+          dom_id: '#swagger-ui',
+        });
+      };
+    </script>
+  </body>
+</html>"#;
+    Html(HTML)
+}
+
+/// Prometheus metrics endpoint
+async fn metrics_endpoint() -> Response {
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+
+    let status = match encoder.encode(&metric_families, &mut buffer) {
+        Ok(_) => StatusCode::OK,
+        Err(err) => {
+            buffer = format!("metrics encoding error: {err}").into_bytes();
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+
+    Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, encoder.format_type())
+        .body(Body::from(buffer))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("failed to build metrics response"))
+                .unwrap()
+        })
+}
+
+fn validate_limit_order_req(req: &LimitOrderRequest) -> Result<(), ApiError> {
+    if req.pool.trim().is_empty() {
+        return Err(ApiError {
+            code: "VALIDATION".to_string(),
+            message: "pool must not be empty".to_string(),
+            details: None,
+        });
+    }
+    if !(req.price.is_finite() && req.price > 0.0) {
+        return Err(ApiError {
+            code: "VALIDATION".to_string(),
+            message: "price must be a positive finite number".to_string(),
+            details: None,
+        });
+    }
+    if !(req.quantity.is_finite() && req.quantity > 0.0) {
+        return Err(ApiError {
+            code: "VALIDATION".to_string(),
+            message: "quantity must be a positive finite number".to_string(),
+            details: None,
+        });
+    }
+    if req.client_order_id.trim().is_empty() || req.client_order_id.parse::<u64>().is_err() {
+        return Err(ApiError {
+            code: "VALIDATION".to_string(),
+            message: "client_order_id must be a non-empty u64 string".to_string(),
+            details: None,
+        });
+    }
+    Ok(())
+}
+
 /// Quote route endpoint - returns route selection without executing
 async fn quote_route(
     State(router): State<Arc<Router>>,
     Json(req): Json<LimitOrderRequest>,
-) -> Result<Json<RouteQuoteResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<RouteQuoteResponse>, (StatusCode, Json<ApiError>)> {
+    let span = info_span!(
+        "http.quote_route",
+        pool = %req.pool,
+        is_bid = req.is_bid,
+        client_order_id = %req.client_order_id
+    );
+    let _enter = span.enter();
+    let _timer = REQ_LATENCY
+        .with_label_values(&["http", "quote"])
+        .start_timer();
+    if let Err(e) = validate_limit_order_req(&req) {
+        REQ_ERRORS.with_label_values(&["http", "quote"]).inc();
+        return Err((StatusCode::BAD_REQUEST, Json(e)));
+    }
     let limit_req = LimitReq {
         pool: req.pool,
         price: req.price,
@@ -199,10 +357,13 @@ async fn quote_route(
     };
 
     let selection = router.select_route(&limit_req).await.map_err(|e| {
+        REQ_ERRORS.with_label_values(&["http", "quote"]).inc();
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
+            Json(ApiError {
+                code: "QUOTE_ERROR".to_string(),
+                message: e.to_string(),
+                details: None,
             }),
         )
     })?;
@@ -246,8 +407,36 @@ async fn quote_route(
 /// Execute order endpoint - routes and executes the order
 async fn execute_order(
     State(router): State<Arc<Router>>,
+    headers: HeaderMap,
     Json(req): Json<LimitOrderRequest>,
-) -> Result<Json<LimitOrderResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<LimitOrderResponse>, (StatusCode, Json<ApiError>)> {
+    let span = info_span!(
+        "http.execute_order",
+        pool = %req.pool,
+        is_bid = req.is_bid,
+        client_order_id = %req.client_order_id,
+        idempotency_key = field::Empty
+    );
+    let _enter = span.enter();
+    let _timer = REQ_LATENCY
+        .with_label_values(&["http", "order"])
+        .start_timer();
+    if let Err(e) = validate_limit_order_req(&req) {
+        REQ_ERRORS.with_label_values(&["http", "order"]).inc();
+        return Err((StatusCode::BAD_REQUEST, Json(e)));
+    }
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if let Some(idem) = &idem_key {
+        span.record("idempotency_key", idem.as_str());
+    }
+    if let Some(ref key) = idem_key {
+        if let Some(resp) = router.idem_get(key).await {
+            return Ok(Json(resp));
+        }
+    }
     let limit_req = LimitReq {
         pool: req.pool,
         price: req.price,
@@ -259,19 +448,26 @@ async fn execute_order(
     };
 
     let result = router.execute_limit_order(&limit_req).await.map_err(|e| {
+        REQ_ERRORS.with_label_values(&["http", "order"]).inc();
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
+            Json(ApiError {
+                code: "ORDER_ERROR".to_string(),
+                message: e.to_string(),
+                details: None,
             }),
         )
     })?;
 
-    Ok(Json(LimitOrderResponse {
+    let response = LimitOrderResponse {
         digest: result.digest,
         effects_time_ms: result.effects_time_ms,
         checkpoint_time_ms: result.checkpoint_time_ms,
-    }))
+    };
+    if let Some(key) = idem_key {
+        router.idem_put(key, response.clone()).await;
+    }
+    Ok(Json(response))
 }
 
 #[derive(Debug, Serialize)]
@@ -283,7 +479,7 @@ pub struct StatsResponse {
 /// Get execution and latency statistics
 async fn get_stats(
     State(router): State<Arc<Router>>,
-) -> Result<Json<StatsResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<StatsResponse>, (StatusCode, Json<ApiError>)> {
     let execution_stats = router.executor().get_stats();
     let latency_stats = router.selector().get_latency_stats().await;
 
@@ -296,7 +492,7 @@ async fn get_stats(
 /// Get latency statistics
 async fn get_latency_stats(
     State(router): State<Arc<Router>>,
-) -> Result<Json<LatencyStats>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<LatencyStats>, (StatusCode, Json<ApiError>)> {
     let stats = router.selector().get_latency_stats().await;
     Ok(Json(stats))
 }
@@ -311,7 +507,7 @@ pub struct UpdateLatencyRequest {
 async fn update_latency(
     State(router): State<Arc<Router>>,
     Json(req): Json<UpdateLatencyRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let selector = router.selector();
     let (current_base, current_shared) = selector.get_latency_estimates();
 

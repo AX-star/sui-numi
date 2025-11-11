@@ -1,0 +1,240 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Ultra Aggregator API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/quote": {
+      "post": {
+        "summary": "Quote a route without executing",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LimitOrderRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Quote computed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RouteQuoteResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/order": {
+      "post": {
+        "summary": "Place a limit order",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "schema": { "type": "string" },
+            "required": false,
+            "description": "Prevents duplicate order placement"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LimitOrderRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order executed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LimitOrderResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats": {
+      "get": {
+        "summary": "Get execution and latency stats",
+        "responses": {
+          "200": {
+            "description": "Stats",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/latency": {
+      "get": {
+        "summary": "Get latency estimates",
+        "responses": {
+          "200": {
+            "description": "Latency stats",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LatencyStats" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Update latency estimates",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateLatencyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "LimitOrderRequest": {
+        "type": "object",
+        "required": ["pool", "price", "quantity", "is_bid", "client_order_id"],
+        "properties": {
+          "pool": { "type": "string" },
+          "price": { "type": "number", "format": "double", "minimum": 0 },
+          "quantity": { "type": "number", "format": "double", "minimum": 0 },
+          "is_bid": { "type": "boolean" },
+          "client_order_id": { "type": "string" },
+          "pay_with_deep": { "type": "boolean" },
+          "expiration_ms": { "type": "integer", "format": "int64" }
+        }
+      },
+      "LimitOrderResponse": {
+        "type": "object",
+        "properties": {
+          "digest": { "type": "string" },
+          "effects_time_ms": { "type": "number", "format": "double" },
+          "checkpoint_time_ms": { "type": "number", "format": "double", "nullable": true }
+        }
+      },
+      "RoutePlanResponse": {
+        "type": "object",
+        "properties": {
+          "route_type": { "type": "string" },
+          "total_cost": { "type": "number", "format": "double" },
+          "l2_price": { "type": "number", "format": "double" },
+          "slippage": { "type": "number", "format": "double" },
+          "gas_cost": { "type": "number", "format": "double" },
+          "latency_penalty": { "type": "number", "format": "double" },
+          "risk_factor": { "type": "number", "format": "double" },
+          "expected_latency_ms": { "type": "integer", "format": "int64" },
+          "uses_shared_objects": { "type": "boolean" },
+          "estimated_gas": { "type": "integer", "format": "int64" }
+        }
+      },
+      "RouteQuoteResponse": {
+        "type": "object",
+        "properties": {
+          "plan": { "$ref": "#/components/schemas/RoutePlanResponse" },
+          "alternatives": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RoutePlanResponse" }
+          }
+        }
+      },
+      "StatsResponse": {
+        "type": "object",
+        "properties": {
+          "execution": { "type": "object" },
+          "latency": { "type": "object" }
+        }
+      },
+      "LatencyStats": {
+        "type": "object",
+        "properties": {
+          "base_latency_ms": { "type": "integer", "format": "int64" },
+          "shared_latency_ms": { "type": "integer", "format": "int64" },
+          "owned_samples": { "type": "integer", "format": "int64" },
+          "shared_samples": { "type": "integer", "format": "int64" }
+        }
+      },
+      "UpdateLatencyRequest": {
+        "type": "object",
+        "properties": {
+          "base_latency_ms": { "type": "integer", "format": "int64" },
+          "shared_latency_ms": { "type": "integer", "format": "int64" }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "details": { "type": "object", "nullable": true }
+        }
+      }
+    }
+  }
+}
+

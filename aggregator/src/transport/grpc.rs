@@ -14,6 +14,11 @@ use tracing::warn;
 
 // Generated modules from build.rs (package "sui.rpc.v2")
 pub mod sui {
+    #![allow(
+        clippy::large_enum_variant,
+        clippy::doc_overindented_list_items,
+        clippy::upper_case_acronyms
+    )]
     pub mod rpc {
         pub mod v2 {
             tonic::include_proto!("sui.rpc.v2");
@@ -22,6 +27,7 @@ pub mod sui {
 }
 
 pub mod google {
+    #![allow(clippy::doc_overindented_list_items)]
     pub mod rpc {
         tonic::include_proto!("google.rpc");
     }
