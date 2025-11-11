@@ -5,24 +5,31 @@
 // Numan Thabit 2025 Nov
 
 use crate::errors::AggrError;
-use crate::router::routes::RoutePlan;
+use crate::metrics::DEEPBOOK_EVENT_COUNTER;
+use crate::quant::{quantize_price, quantize_size};
+use crate::router::routes::{Route, RoutePlan};
 use crate::router::validator::ValidatorSelector;
 use crate::signing::sign_tx_bcs_ed25519_to_serialized_signature;
 use crate::sponsorship::{SponsorshipManager, SponsorshipRequest};
 use crate::transport::grpc::sui::rpc::v2::ExecutedTransaction;
 use crate::transport::grpc::GrpcClients;
 use crate::transport::jsonrpc::JsonRpc;
-use crate::venues::adapter::DeepBookAdapter;
+use crate::venues::adapter::{BalanceSnapshot, DeepBookAdapter, LimitReq};
 use anyhow::{Context, Result};
 use backoff::{future::retry, ExponentialBackoff};
 use bcs;
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use sui_sdk::rpc_types::SuiEvent;
 use sui_sdk::types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_sdk::types::transaction::{InputObjectKind, TransactionData, TransactionKind};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+const MICROS_PER_UNIT: f64 = 1_000_000.0;
+const PRICE_TOLERANCE: f64 = 1e-6;
 
 /// Execution statistics for monitoring
 #[derive(Debug, Clone, serde::Serialize)]
@@ -33,6 +40,94 @@ pub struct ExecutionStats {
     pub avg_effects_time_ms: Option<f64>,
     pub avg_checkpoint_time_ms: Option<f64>,
     pub success_rate: f64,
+    pub total_quote_fees: f64,
+    pub total_deep_fees: f64,
+    pub total_quote_rebates: f64,
+    pub total_deep_rebates: f64,
+    pub total_sponsored_gas: u64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeKind {
+    Maker,
+    Taker,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeepBookAccounting {
+    pub pool: String,
+    pub fee_kind: FeeKind,
+    pub fee_rate: f64,
+    pub quote_fee: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deep_fee: Option<f64>,
+    pub quote_rebate_delta: f64,
+    pub deep_rebate_delta: f64,
+    pub pay_with_deep: bool,
+    pub stake_required: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct DeepBookEventStats {
+    pub placed: u64,
+    pub filled: u64,
+    pub cancelled: u64,
+    pub settled: u64,
+    pub other: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_base_filled: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_quote_filled: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct ExecutionAccounting {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deepbook: Vec<DeepBookAccounting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sponsor_gas_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepbook_events: Option<DeepBookEventStats>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrderHandle {
+    pub pool: String,
+    pub order_id: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct OrderRecord {
+    digest: String,
+    pool: String,
+    order_id: u128,
+    client_order_id: Option<u64>,
+}
+
+#[derive(Default)]
+struct OrderIndex {
+    by_digest: HashMap<String, Vec<OrderRecord>>,
+}
+
+impl OrderIndex {
+    fn insert(&mut self, record: OrderRecord) {
+        self.by_digest
+            .entry(record.digest.clone())
+            .or_default()
+            .push(record);
+    }
+
+    fn find_by_digest_pool(&self, digest: &str, pool: &str) -> Option<OrderRecord> {
+        self.by_digest
+            .get(digest)
+            .and_then(|records| records.iter().rev().find(|rec| rec.pool == pool))
+            .cloned()
+    }
 }
 
 /// Execution result with timing information
@@ -44,6 +139,8 @@ pub struct ExecutionResult {
     pub effects_time_ms: f64,
     /// Time from submission to checkpoint inclusion (milliseconds)
     pub checkpoint_time_ms: Option<f64>,
+    pub accounting: ExecutionAccounting,
+    pub orders: Vec<OrderHandle>,
 }
 
 /// Execution engine that compiles routes to PTBs and executes them
@@ -68,6 +165,12 @@ pub struct ExecutionEngine {
     total_effects_time_ms: AtomicU64, // Sum of all effects times in milliseconds (as u64 * 1000 for precision)
     total_checkpoint_time_ms: AtomicU64, // Sum of all checkpoint times in milliseconds
     checkpoint_count: AtomicU64,
+    total_quote_fees_micros: AtomicU64,
+    total_deep_fees_micros: AtomicU64,
+    total_quote_rebates_micros: AtomicU64,
+    total_deep_rebates_micros: AtomicU64,
+    total_sponsor_gas: AtomicU64,
+    order_index: Arc<tokio::sync::RwLock<OrderIndex>>,
 }
 
 impl ExecutionEngine {
@@ -96,6 +199,12 @@ impl ExecutionEngine {
             total_effects_time_ms: AtomicU64::new(0),
             total_checkpoint_time_ms: AtomicU64::new(0),
             checkpoint_count: AtomicU64::new(0),
+            total_quote_fees_micros: AtomicU64::new(0),
+            total_deep_fees_micros: AtomicU64::new(0),
+            total_quote_rebates_micros: AtomicU64::new(0),
+            total_deep_rebates_micros: AtomicU64::new(0),
+            total_sponsor_gas: AtomicU64::new(0),
+            order_index: Arc::new(tokio::sync::RwLock::new(OrderIndex::default())),
         }
     }
 
@@ -126,6 +235,15 @@ impl ExecutionEngine {
         let total_checkpoint_ms =
             self.total_checkpoint_time_ms.load(Ordering::Relaxed) as f64 / 1000.0;
         let checkpoint_count = self.checkpoint_count.load(Ordering::Relaxed);
+        let total_quote_fees =
+            self.total_quote_fees_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let total_deep_fees =
+            self.total_deep_fees_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let total_quote_rebates =
+            self.total_quote_rebates_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let total_deep_rebates =
+            self.total_deep_rebates_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let total_sponsored_gas = self.total_sponsor_gas.load(Ordering::Relaxed);
 
         ExecutionStats {
             total_executions: total,
@@ -146,6 +264,11 @@ impl ExecutionEngine {
             } else {
                 0.0
             },
+            total_quote_fees,
+            total_deep_fees,
+            total_quote_rebates,
+            total_deep_rebates,
+            total_sponsored_gas,
         }
     }
 
@@ -157,6 +280,18 @@ impl ExecutionEngine {
         use_sponsorship: bool,
     ) -> Result<ExecutionResult> {
         self.total_executions.fetch_add(1, Ordering::Relaxed);
+
+        let uses_deepbook = !Self::deepbook_requests(plan).is_empty();
+        let pre_balances = if uses_deepbook {
+            if let Some(adapter) = &self.deepbook {
+                Self::collect_balance_snapshots(adapter, plan).await
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+
         // 1. Compile route to PTB (may be gasless if sponsorship is enabled)
         let (tx_bcs, is_sponsored) = if use_sponsorship && self.sponsorship.is_some() {
             self.compile_route_sponsored(plan).await?
@@ -251,6 +386,73 @@ impl ExecutionEngine {
             self.checkpoint_count.fetch_add(1, Ordering::Relaxed);
         }
 
+        let mut accounting = ExecutionAccounting::default();
+        let mut orders: Vec<OrderHandle> = Vec::new();
+        let gas_used = Self::extract_gas_used(&executed);
+        if let Some(gas) = gas_used {
+            accounting.gas_used = Some(gas);
+        }
+
+        if uses_deepbook {
+            if let Some(adapter) = &self.deepbook {
+                let events = match adapter.deepbook_events_for_digest(&digest).await {
+                    Ok(events) => events,
+                    Err(err) => {
+                        warn!(
+                            digest = %digest,
+                            error = %err,
+                            "failed to fetch DeepBook events for analytics"
+                        );
+                        Vec::new()
+                    }
+                };
+
+                if !events.is_empty() {
+                    accounting.deepbook_events = Self::summarize_deepbook_events(&events);
+                }
+
+                match Self::build_deepbook_accounting(adapter, plan, &pre_balances).await {
+                    Ok(breakdown) => accounting.deepbook = breakdown,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "failed to compute DeepBook accounting for executed route"
+                        );
+                    }
+                }
+
+                orders = if events.is_empty() {
+                    Self::collect_order_handles(adapter, plan, &digest, None).await
+                } else {
+                    Self::collect_order_handles(adapter, plan, &digest, Some(&events)).await
+                };
+            }
+        }
+
+        if is_sponsored {
+            if let Some(gas) = gas_used {
+                if let Some(manager) = &self.sponsorship {
+                    let route_class = Self::route_class(plan);
+                    manager
+                        .apply_spending(self.user_address, Some(route_class.as_str()), gas)
+                        .await;
+                    accounting.sponsor_gas_used = Some(gas);
+                    self.total_sponsor_gas.fetch_add(gas, Ordering::Relaxed);
+                }
+            } else {
+                warn!(
+                    digest = %digest,
+                    "sponsored transaction executed but gas usage unavailable"
+                );
+            }
+        }
+
+        if !orders.is_empty() {
+            self.record_order_handles(&digest, &orders).await;
+        }
+
+        self.update_fee_counters(&accounting);
+
         info!(
             digest = %digest,
             effects_ms = effects_time_ms,
@@ -264,6 +466,8 @@ impl ExecutionEngine {
             executed,
             effects_time_ms,
             checkpoint_time_ms,
+            accounting,
+            orders,
         })
     }
 
@@ -285,8 +489,15 @@ impl ExecutionEngine {
             }
             crate::router::routes::Route::CancelReplace {
                 cancel_digest,
+                existing_order_id,
                 replace,
-            } => self.compile_cancel_replace(cancel_digest, replace).await,
+            } => {
+                self.compile_cancel_replace(cancel_digest.as_deref(), *existing_order_id, replace)
+                    .await
+            }
+            crate::router::routes::Route::CancelDeepBook { pool, order_id } => {
+                self.compile_cancel(pool, *order_id).await
+            }
             crate::router::routes::Route::FlashLoanArb { .. } => {
                 // Flash loan routes require flash loan contract integration
                 // For now, return an error indicating it needs implementation
@@ -413,7 +624,8 @@ impl ExecutionEngine {
     /// Compile a cancel-and-replace route into a single PTB
     async fn compile_cancel_replace(
         &self,
-        cancel_digest: &str,
+        cancel_digest: Option<&str>,
+        existing_order_id: Option<u128>,
         replace: &crate::venues::adapter::LimitReq,
     ) -> Result<Vec<u8>> {
         let adapter = self
@@ -427,20 +639,24 @@ impl ExecutionEngine {
 
         let mut ptb = ProgrammableTransactionBuilder::new();
 
-        // 1. Look up the order ID from the transaction digest
-        let order_id = adapter
-            .get_order_id_from_digest(cancel_digest, &replace.pool)
-            .await
-            .context("lookup order ID from transaction digest")?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "could not find order ID in transaction digest: {}",
-                    cancel_digest
-                )
+        // 1. Determine order id (either from stored state or by digest lookup)
+        let order_id = if let Some(id) = existing_order_id {
+            id
+        } else {
+            let digest = cancel_digest.ok_or_else(|| {
+                anyhow::anyhow!("cancel_replace requires either existing_order_id or cancel_digest")
             })?;
+            adapter
+                .get_order_id_from_digest(digest, &replace.pool)
+                .await
+                .context("lookup order ID from transaction digest")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("could not find order ID in transaction digest: {}", digest)
+                })?
+        };
 
         info!(
-            cancel_digest = cancel_digest,
+            cancel_digest = ?cancel_digest,
             order_id = order_id,
             pool = replace.pool,
             "found order ID for cancel-replace"
@@ -524,6 +740,17 @@ impl ExecutionEngine {
             .map_err(|e| AggrError::BuildTx(format!("serialize transaction: {}", e)))?;
 
         Ok(tx_bcs)
+    }
+
+    async fn compile_cancel(&self, pool: &str, order_id: u128) -> Result<Vec<u8>> {
+        let adapter = self
+            .deepbook
+            .as_ref()
+            .context("DeepBook adapter not available")?;
+        adapter
+            .build_cancel_order_ptb_bcs(pool, order_id)
+            .await
+            .context("build DeepBook cancel order PTB")
     }
 
     /// Compile a route plan into a sponsored PTB
@@ -711,6 +938,477 @@ impl ExecutionEngine {
              Use gRPC execution (--features grpc-exec) for full functionality. Digest: {:?}",
             _resp.digest
         );
+    }
+
+    fn route_class(plan: &RoutePlan) -> String {
+        format!("{:?}", plan.route)
+    }
+
+    fn deepbook_requests(plan: &RoutePlan) -> Vec<&LimitReq> {
+        match &plan.route {
+            Route::DeepBookSingle(req) => vec![req],
+            Route::MultiVenueSplit { deepbook } => deepbook.iter().collect(),
+            Route::CancelReplace { replace, .. } => vec![replace],
+            Route::FlashLoanArb { .. } => Vec::new(),
+            Route::CancelDeepBook { .. } => Vec::new(),
+        }
+    }
+
+    async fn collect_balance_snapshots(
+        adapter: &DeepBookAdapter,
+        plan: &RoutePlan,
+    ) -> HashMap<String, BalanceSnapshot> {
+        let mut snapshots = HashMap::new();
+        let mut seen = HashSet::new();
+
+        for req in Self::deepbook_requests(plan) {
+            let pool = req.pool.clone();
+            if !seen.insert(pool.clone()) {
+                continue;
+            }
+
+            adapter.invalidate_pool_balances(&pool).await;
+
+            match adapter.balance_manager_balances(&pool).await {
+                Ok(snapshot) => {
+                    snapshots.insert(pool, snapshot);
+                }
+                Err(err) => {
+                    warn!(pool = %pool, error = %err, "failed to fetch pre-trade balances");
+                }
+            }
+        }
+
+        snapshots
+    }
+
+    async fn build_deepbook_accounting(
+        adapter: &DeepBookAdapter,
+        plan: &RoutePlan,
+        pre_balances: &HashMap<String, BalanceSnapshot>,
+    ) -> Result<Vec<DeepBookAccounting>> {
+        let mut breakdowns = Vec::new();
+
+        for req in Self::deepbook_requests(plan) {
+            let pool = req.pool.clone();
+
+            adapter.invalidate_pool_balances(&pool).await;
+
+            let params = match adapter.pool_params(&pool).await {
+                Ok(params) => params,
+                Err(err) => {
+                    warn!(pool = %pool, error = %err, "failed to fetch pool params for accounting");
+                    continue;
+                }
+            };
+
+            let q_price = match quantize_price(req.price, params.tick_size) {
+                Ok(price) => price,
+                Err(err) => {
+                    warn!(
+                        pool = %pool,
+                        error = %err,
+                        "failed to quantize price for accounting"
+                    );
+                    continue;
+                }
+            };
+
+            let q_size = match quantize_size(req.quantity, params.lot_size, params.min_size) {
+                Ok(size) => size,
+                Err(err) => {
+                    warn!(
+                        pool = %pool,
+                        error = %err,
+                        "failed to quantize size for accounting"
+                    );
+                    continue;
+                }
+            };
+
+            let fee_kind = match Self::determine_fee_kind(adapter, req).await {
+                Ok(kind) => kind,
+                Err(err) => {
+                    debug!(
+                        pool = %pool,
+                        error = %err,
+                        "failed to determine fee kind; defaulting to taker"
+                    );
+                    FeeKind::Taker
+                }
+            };
+
+            let trade_params = match adapter.trade_params(&pool).await {
+                Ok(params) => params,
+                Err(err) => {
+                    warn!(pool = %pool, error = %err, "failed to fetch trade params");
+                    continue;
+                }
+            };
+
+            let fee_rate = match fee_kind {
+                FeeKind::Maker => trade_params.maker_fee,
+                FeeKind::Taker => trade_params.taker_fee,
+            };
+
+            let notional = q_price * q_size;
+            let quote_fee = notional * fee_rate;
+            if !quote_fee.is_finite() || quote_fee.is_sign_negative() {
+                warn!(
+                    pool = %pool,
+                    quote_fee = quote_fee,
+                    "computed quote fee is invalid"
+                );
+                continue;
+            }
+
+            let deep_fee = if req.pay_with_deep {
+                match adapter.deep_price(&pool).await {
+                    Ok(price) => {
+                        if let Some(deep_per_quote) = price.deep_per_quote {
+                            let deep_fee = quote_fee * deep_per_quote;
+                            if deep_fee.is_finite() && !deep_fee.is_sign_negative() {
+                                Some(deep_fee)
+                            } else {
+                                warn!(
+                                    pool = %pool,
+                                    deep_fee = deep_fee,
+                                    "computed DEEP fee (quote path) is invalid"
+                                );
+                                None
+                            }
+                        } else if let Some(deep_per_base) = price.deep_per_base {
+                            let base_fee = q_size * fee_rate;
+                            let deep_fee = base_fee * deep_per_base;
+                            if deep_fee.is_finite() && !deep_fee.is_sign_negative() {
+                                Some(deep_fee)
+                            } else {
+                                warn!(
+                                    pool = %pool,
+                                    deep_fee = deep_fee,
+                                    "computed DEEP fee (base path) is invalid"
+                                );
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => {
+                        warn!(pool = %pool, error = %err, "failed to fetch DEEP price for accounting");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let post_snapshot = match adapter.balance_manager_balances(&pool).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    warn!(pool = %pool, error = %err, "failed to fetch post-trade balances");
+                    continue;
+                }
+            };
+
+            let quote_rebate_delta = pre_balances
+                .get(&pool)
+                .map(|snap| post_snapshot.unclaimed_quote - snap.unclaimed_quote)
+                .unwrap_or(0.0);
+            let deep_rebate_delta = pre_balances
+                .get(&pool)
+                .map(|snap| post_snapshot.unclaimed_deep - snap.unclaimed_deep)
+                .unwrap_or(0.0);
+
+            breakdowns.push(DeepBookAccounting {
+                pool,
+                fee_kind,
+                fee_rate,
+                quote_fee,
+                deep_fee,
+                quote_rebate_delta,
+                deep_rebate_delta,
+                pay_with_deep: req.pay_with_deep,
+                stake_required: trade_params.stake_required,
+            });
+        }
+
+        Ok(breakdowns)
+    }
+
+    async fn determine_fee_kind(adapter: &DeepBookAdapter, req: &LimitReq) -> Result<FeeKind> {
+        let mid_price = adapter.mid_price(&req.pool).await?;
+        let is_taker = if req.is_bid {
+            req.price + PRICE_TOLERANCE >= mid_price
+        } else {
+            req.price <= mid_price + PRICE_TOLERANCE
+        };
+
+        Ok(if is_taker {
+            FeeKind::Taker
+        } else {
+            FeeKind::Maker
+        })
+    }
+
+    fn extract_gas_used(executed: &ExecutedTransaction) -> Option<u64> {
+        let effects = executed.effects.as_ref()?;
+        let gas_used = effects.gas_used.as_ref()?;
+        let computation = gas_used.computation_cost?;
+        let storage = gas_used.storage_cost?;
+        let rebate = gas_used.storage_rebate.unwrap_or(0);
+        computation.checked_add(storage)?.checked_sub(rebate)
+    }
+
+    async fn collect_order_handles(
+        adapter: &DeepBookAdapter,
+        plan: &RoutePlan,
+        digest: &str,
+        events: Option<&[SuiEvent]>,
+    ) -> Vec<OrderHandle> {
+        let mut handles = Vec::new();
+        let mut seen = HashSet::new();
+
+        for req in Self::deepbook_requests(plan) {
+            let pool = req.pool.clone();
+            if !seen.insert(pool.clone()) {
+                continue;
+            }
+
+            let mut order_id_opt =
+                events.and_then(|ev| adapter.order_id_from_events(ev, &pool, digest));
+
+            if order_id_opt.is_none() && events.is_none() {
+                match adapter.get_order_id_from_digest(digest, &pool).await {
+                    Ok(Some(order_id)) => order_id_opt = Some(order_id),
+                    Ok(None) => (),
+                    Err(err) => {
+                        warn!(
+                            digest = %digest,
+                            pool = %pool,
+                            error = %err,
+                            "failed to derive DeepBook order id from transaction digest"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            match order_id_opt {
+                Some(order_id) => {
+                    let client_order_id = req.client_order_id.parse::<u64>().ok();
+                    handles.push(OrderHandle {
+                        pool,
+                        order_id,
+                        client_order_id,
+                    });
+                }
+                None => {
+                    debug!(
+                        digest = %digest,
+                        pool = %pool,
+                        "no DeepBook order id found in transaction events"
+                    );
+                }
+            }
+        }
+
+        handles
+    }
+
+    fn summarize_deepbook_events(events: &[SuiEvent]) -> Option<DeepBookEventStats> {
+        if events.is_empty() {
+            return None;
+        }
+
+        let mut stats = DeepBookEventStats::default();
+        let mut total_base = 0.0;
+        let mut total_quote = 0.0;
+
+        for event in events {
+            let module = event.type_.module.as_str();
+            let name = event.type_.name.as_str();
+
+            if module != "clob" && module != "clob_v2" {
+                continue;
+            }
+
+            match name {
+                "OrderPlaced" | "OrderPlacedV2" => {
+                    stats.placed += 1;
+                    DEEPBOOK_EVENT_COUNTER.with_label_values(&["placed"]).inc();
+                }
+                "OrderFilled" | "OrderFilledV2" | "OrderMatch" | "OrderMatched" | "OrderFill" => {
+                    stats.filled += 1;
+                    DEEPBOOK_EVENT_COUNTER.with_label_values(&["filled"]).inc();
+                    if let Some(base) = Self::event_f64_field(
+                        &event.parsed_json,
+                        &[
+                            "filledQuantity",
+                            "baseFilled",
+                            "quantityFilled",
+                            "base_filled",
+                        ],
+                    ) {
+                        total_base += base;
+                    }
+                    if let Some(quote) =
+                        Self::event_f64_field(&event.parsed_json, &["quoteFilled", "quote_filled"])
+                    {
+                        total_quote += quote;
+                    }
+                }
+                "OrderCancelled" | "OrderCanceled" => {
+                    stats.cancelled += 1;
+                    DEEPBOOK_EVENT_COUNTER
+                        .with_label_values(&["cancelled"])
+                        .inc();
+                }
+                "OrderSettled" | "OrderSettledV2" => {
+                    stats.settled += 1;
+                    DEEPBOOK_EVENT_COUNTER.with_label_values(&["settled"]).inc();
+                }
+                _ => {
+                    stats.other += 1;
+                    DEEPBOOK_EVENT_COUNTER.with_label_values(&["other"]).inc();
+                }
+            }
+        }
+
+        if stats.placed == 0
+            && stats.filled == 0
+            && stats.cancelled == 0
+            && stats.settled == 0
+            && stats.other == 0
+        {
+            return None;
+        }
+
+        if total_base > 0.0 {
+            stats.total_base_filled = Some(total_base);
+        }
+        if total_quote > 0.0 {
+            stats.total_quote_filled = Some(total_quote);
+        }
+
+        Some(stats)
+    }
+
+    fn event_f64_field(value: &Value, keys: &[&str]) -> Option<f64> {
+        for key in keys {
+            if let Some(v) = value.get(*key) {
+                match v {
+                    Value::Number(n) => {
+                        if let Some(f) = n.as_f64() {
+                            return Some(f);
+                        }
+                    }
+                    Value::String(s) => {
+                        if let Ok(f) = s.parse::<f64>() {
+                            return Some(f);
+                        }
+                    }
+                    Value::Object(obj) => {
+                        if let Some(Value::Number(n)) = obj.get("value") {
+                            if let Some(f) = n.as_f64() {
+                                return Some(f);
+                            }
+                        } else if let Some(Value::String(s)) = obj.get("value") {
+                            if let Ok(f) = s.parse::<f64>() {
+                                return Some(f);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    async fn record_order_handles(&self, digest: &str, handles: &[OrderHandle]) {
+        if handles.is_empty() {
+            return;
+        }
+        let mut index = self.order_index.write().await;
+        for handle in handles {
+            index.insert(OrderRecord {
+                digest: digest.to_string(),
+                pool: handle.pool.clone(),
+                order_id: handle.order_id,
+                client_order_id: handle.client_order_id,
+            });
+        }
+    }
+
+    pub async fn order_handle_from_digest(&self, digest: &str, pool: &str) -> Option<OrderHandle> {
+        let index = self.order_index.read().await;
+        index
+            .find_by_digest_pool(digest, pool)
+            .map(|record| OrderHandle {
+                pool: record.pool,
+                order_id: record.order_id,
+                client_order_id: record.client_order_id,
+            })
+    }
+
+    pub async fn record_external_order(&self, digest: String, handle: OrderHandle) {
+        let mut index = self.order_index.write().await;
+        index.insert(OrderRecord {
+            digest,
+            pool: handle.pool.clone(),
+            order_id: handle.order_id,
+            client_order_id: handle.client_order_id,
+        });
+    }
+
+    fn update_fee_counters(&self, accounting: &ExecutionAccounting) {
+        if accounting.deepbook.is_empty() {
+            return;
+        }
+
+        let total_quote_fees: f64 = accounting
+            .deepbook
+            .iter()
+            .map(|entry| entry.quote_fee.max(0.0))
+            .sum();
+        let total_deep_fees: f64 = accounting
+            .deepbook
+            .iter()
+            .filter_map(|entry| entry.deep_fee)
+            .map(|value| value.max(0.0))
+            .sum();
+        let total_quote_rebates: f64 = accounting
+            .deepbook
+            .iter()
+            .map(|entry| entry.quote_rebate_delta.max(0.0))
+            .sum();
+        let total_deep_rebates: f64 = accounting
+            .deepbook
+            .iter()
+            .map(|entry| entry.deep_rebate_delta.max(0.0))
+            .sum();
+
+        self.total_quote_fees_micros
+            .fetch_add(Self::to_micros(total_quote_fees), Ordering::Relaxed);
+        self.total_deep_fees_micros
+            .fetch_add(Self::to_micros(total_deep_fees), Ordering::Relaxed);
+        self.total_quote_rebates_micros
+            .fetch_add(Self::to_micros(total_quote_rebates), Ordering::Relaxed);
+        self.total_deep_rebates_micros
+            .fetch_add(Self::to_micros(total_deep_rebates), Ordering::Relaxed);
+    }
+
+    fn to_micros(value: f64) -> u64 {
+        if !value.is_finite() || value <= 0.0 {
+            return 0;
+        }
+        let scaled = (value * MICROS_PER_UNIT).round();
+        if scaled >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            scaled as u64
+        }
     }
 
     /// Compute transaction digest from BCS bytes

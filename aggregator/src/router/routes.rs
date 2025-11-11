@@ -19,9 +19,12 @@ pub enum Route {
     },
     /// Cancel and replace chain
     CancelReplace {
-        cancel_digest: String,
+        cancel_digest: Option<String>,
+        existing_order_id: Option<u128>,
         replace: LimitReq,
     },
+    /// Cancel an existing DeepBook order without placing a replacement
+    CancelDeepBook { pool: String, order_id: u128 },
     /// Flash-loan backed arbitrage (future)
     FlashLoanArb {
         // TODO: Define flash loan route structure
@@ -133,6 +136,35 @@ impl RoutePlan {
             .total_cost
             .partial_cmp(&other.score.total_cost)
             .unwrap_or(std::cmp::Ordering::Equal)
+    }
+
+    pub fn cancel_deepbook(pool: String, order_id: u128, estimated_gas: u64) -> Self {
+        Self {
+            route: Route::CancelDeepBook { pool, order_id },
+            score: RouteScore::new(0.0, 0.0, 0.0, 0.0, 0.0),
+            expected_latency_ms: 2_000,
+            uses_shared_objects: true,
+            estimated_gas,
+        }
+    }
+
+    pub fn cancel_replace(
+        cancel_digest: Option<String>,
+        existing_order_id: Option<u128>,
+        replace: LimitReq,
+        estimated_gas: u64,
+    ) -> Self {
+        Self {
+            route: Route::CancelReplace {
+                cancel_digest,
+                existing_order_id,
+                replace,
+            },
+            score: RouteScore::new(0.0, 0.0, 0.0, 0.0, 0.0),
+            expected_latency_ms: 3_000,
+            uses_shared_objects: true,
+            estimated_gas,
+        }
     }
 }
 

@@ -20,14 +20,37 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{field, info_span};
 
-use super::{ExecutionEngine, RouteSelector};
+use super::{ExecutionEngine, RoutePlan, RouteSelector};
 use crate::control::{AdmissionControl, CircuitBreakers};
 use crate::metrics::{REQ_ERRORS, REQ_LATENCY};
-use crate::router::execution::{ExecutionResult, ExecutionStats};
+use crate::router::execution::ExecutionAccounting;
+use crate::router::execution::{ExecutionResult, ExecutionStats, OrderHandle};
 use crate::router::routes::RouteSelection;
 use crate::router::selector::LatencyStats;
 use crate::router::validation::validate_limit_order;
 use anyhow::{Context, Result};
+
+const CANCEL_GAS_ESTIMATE: u64 = 5_000_000;
+const CANCEL_REPLACE_GAS_ESTIMATE: u64 = 15_000_000;
+
+#[derive(Debug, Deserialize)]
+pub struct CancelOrderRequest {
+    pub pool: String,
+    #[serde(default)]
+    pub order_id: Option<String>,
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplaceOrderRequest {
+    #[serde(flatten)]
+    pub order: LimitOrderRequest,
+    #[serde(default)]
+    pub cancel_order_id: Option<String>,
+    #[serde(default)]
+    pub cancel_digest: Option<String>,
+}
 
 /// High-level Router that ties selection and execution together
 pub struct Router {
@@ -72,7 +95,7 @@ impl Router {
         &self.executor
     }
 
-    async fn idem_get(&self, key: &str) -> Option<LimitOrderResponse> {
+    async fn idem_get(&self, key: &str) -> Option<OrderActionResponse> {
         let guard = self.idempotency.read().await;
         if let Some(entry) = guard.get(key) {
             if entry.at.elapsed() < self.idem_ttl {
@@ -82,7 +105,7 @@ impl Router {
         None
     }
 
-    async fn idem_put(&self, key: String, response: LimitOrderResponse) {
+    async fn idem_put(&self, key: String, response: OrderActionResponse) {
         let mut guard = self.idempotency.write().await;
         guard.insert(
             key,
@@ -158,7 +181,7 @@ impl Router {
 #[derive(Clone)]
 struct IdemEntry {
     at: Instant,
-    response: LimitOrderResponse,
+    response: OrderActionResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,10 +196,14 @@ pub struct LimitOrderRequest {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct LimitOrderResponse {
+pub struct OrderActionResponse {
     pub digest: String,
     pub effects_time_ms: f64,
     pub checkpoint_time_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<ExecutionAccounting>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orders: Vec<OrderHandle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +243,8 @@ pub fn create_api_router(router: Arc<Router>) -> AxumRouter {
         .route("/metrics", get(metrics_endpoint))
         .route("/api/v1/quote", post(quote_route))
         .route("/api/v1/order", post(execute_order))
+        .route("/api/v1/order/cancel", post(cancel_order))
+        .route("/api/v1/order/replace", post(replace_order))
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/latency", get(get_latency_stats))
         .route("/api/v1/latency", post(update_latency))
@@ -409,7 +438,7 @@ async fn execute_order(
     State(router): State<Arc<Router>>,
     headers: HeaderMap,
     Json(req): Json<LimitOrderRequest>,
-) -> Result<Json<LimitOrderResponse>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<OrderActionResponse>, (StatusCode, Json<ApiError>)> {
     let span = info_span!(
         "http.execute_order",
         pool = %req.pool,
@@ -447,7 +476,7 @@ async fn execute_order(
         expiration_ms: req.expiration_ms,
     };
 
-    let result = router.execute_limit_order(&limit_req).await.map_err(|e| {
+    let execution = router.execute_limit_order(&limit_req).await.map_err(|e| {
         REQ_ERRORS.with_label_values(&["http", "order"]).inc();
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -459,15 +488,67 @@ async fn execute_order(
         )
     })?;
 
-    let response = LimitOrderResponse {
-        digest: result.digest,
-        effects_time_ms: result.effects_time_ms,
-        checkpoint_time_ms: result.checkpoint_time_ms,
-    };
+    let response = into_order_response(execution);
     if let Some(key) = idem_key {
         router.idem_put(key, response.clone()).await;
     }
     Ok(Json(response))
+}
+
+async fn cancel_order(
+    State(router): State<Arc<Router>>,
+    Json(req): Json<CancelOrderRequest>,
+) -> Result<Json<OrderActionResponse>, (StatusCode, Json<ApiError>)> {
+    if req.pool.trim().is_empty() {
+        return Err(bad_request("VALIDATION", "pool must not be empty"));
+    }
+
+    let order_id = resolve_order_id(&router, &req.pool, &req.order_id, &req.digest).await?;
+
+    let plan = RoutePlan::cancel_deepbook(req.pool.clone(), order_id, CANCEL_GAS_ESTIMATE);
+    let execution = router
+        .executor()
+        .execute(&plan)
+        .await
+        .map_err(|e| internal_error("CANCEL_ERROR", e))?;
+
+    Ok(Json(into_order_response(execution)))
+}
+
+async fn replace_order(
+    State(router): State<Arc<Router>>,
+    Json(req): Json<ReplaceOrderRequest>,
+) -> Result<Json<OrderActionResponse>, (StatusCode, Json<ApiError>)> {
+    validate_limit_order_req(&req.order).map_err(|err| (StatusCode::BAD_REQUEST, Json(err)))?;
+
+    let pool = req.order.pool.clone();
+    let order_id =
+        resolve_order_id(&router, &pool, &req.cancel_order_id, &req.cancel_digest).await?;
+
+    let limit_req = LimitReq {
+        pool,
+        price: req.order.price,
+        quantity: req.order.quantity,
+        is_bid: req.order.is_bid,
+        client_order_id: req.order.client_order_id,
+        pay_with_deep: req.order.pay_with_deep.unwrap_or(false),
+        expiration_ms: req.order.expiration_ms,
+    };
+
+    let plan = RoutePlan::cancel_replace(
+        req.cancel_digest.clone(),
+        Some(order_id),
+        limit_req,
+        CANCEL_REPLACE_GAS_ESTIMATE,
+    );
+
+    let execution = router
+        .executor()
+        .execute(&plan)
+        .await
+        .map_err(|e| internal_error("REPLACE_ERROR", e))?;
+
+    Ok(Json(into_order_response(execution)))
 }
 
 #[derive(Debug, Serialize)]
@@ -522,4 +603,130 @@ async fn update_latency(
         "previous_base_latency_ms": current_base,
         "previous_shared_latency_ms": current_shared,
     })))
+}
+
+fn into_order_response(execution: ExecutionResult) -> OrderActionResponse {
+    let ExecutionResult {
+        digest,
+        executed: _executed,
+        effects_time_ms,
+        checkpoint_time_ms,
+        accounting,
+        orders,
+    } = execution;
+
+    let accounting = if accounting.deepbook.is_empty()
+        && accounting.gas_used.is_none()
+        && accounting.sponsor_gas_used.is_none()
+    {
+        None
+    } else {
+        Some(accounting)
+    };
+
+    OrderActionResponse {
+        digest,
+        effects_time_ms,
+        checkpoint_time_ms,
+        accounting,
+        orders,
+    }
+}
+
+async fn resolve_order_id(
+    router: &Router,
+    pool: &str,
+    order_id_field: &Option<String>,
+    digest_field: &Option<String>,
+) -> Result<u128, (StatusCode, Json<ApiError>)> {
+    if let Some(order_id) = parse_order_id_field(order_id_field, "order_id")? {
+        return Ok(order_id);
+    }
+
+    let digest = match digest_field.as_ref() {
+        Some(d) if !d.trim().is_empty() => d.trim(),
+        _ => {
+            return Err(bad_request(
+                "VALIDATION",
+                "either order_id or digest must be provided",
+            ))
+        }
+    };
+
+    if let Some(handle) = router
+        .executor()
+        .order_handle_from_digest(digest, pool)
+        .await
+    {
+        return Ok(handle.order_id);
+    }
+
+    let adapter = router
+        .selector()
+        .deepbook_adapter()
+        .ok_or_else(|| internal_error("NOT_AVAILABLE", "DeepBook adapter not configured"))?;
+
+    let order_id = adapter
+        .get_order_id_from_digest(digest, pool)
+        .await
+        .map_err(|e| internal_error("ORDER_LOOKUP", e))?
+        .ok_or_else(|| {
+            bad_request(
+                "ORDER_LOOKUP",
+                format!("could not find order in digest {}", digest),
+            )
+        })?;
+
+    router
+        .executor()
+        .record_external_order(
+            digest.to_string(),
+            OrderHandle {
+                pool: pool.to_string(),
+                order_id,
+                client_order_id: None,
+            },
+        )
+        .await;
+
+    Ok(order_id)
+}
+
+fn parse_order_id_field(
+    field: &Option<String>,
+    name: &str,
+) -> Result<Option<u128>, (StatusCode, Json<ApiError>)> {
+    if let Some(value) = field {
+        let parsed = value.trim().parse::<u128>().map_err(|_| {
+            bad_request(
+                "VALIDATION",
+                format!("{name} must be a decimal-encoded u128 string"),
+            )
+        })?;
+        Ok(Some(parsed))
+    } else {
+        Ok(None)
+    }
+}
+
+fn bad_request(code: &str, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            code: code.to_string(),
+            message: message.into(),
+            details: None,
+        }),
+    )
+}
+
+fn internal_error(code: &str, err: impl std::fmt::Display) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            code: code.to_string(),
+            message: err.to_string(),
+            details: None,
+        }),
+    )
 }

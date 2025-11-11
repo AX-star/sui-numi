@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ultra_aggr::config::AppConfig;
 use ultra_aggr::control::{AdmissionControl, CircuitBreakers};
@@ -42,16 +42,9 @@ async fn run() -> Result<()> {
 
     let deepbook = if let Some(settings) = config.deepbook_settings()? {
         Some(
-            DeepBookAdapter::new(
-                settings.indexer.as_str(),
-                config.jsonrpc_endpoint.as_str(),
-                sui_address,
-                &settings.balance_manager_object,
-                &settings.balance_manager_label,
-                settings.environment,
-            )
-            .await
-            .context("initialize DeepBook adapter")?,
+            DeepBookAdapter::new(config.jsonrpc_endpoint.as_str(), sui_address, &settings)
+                .await
+                .context("initialize DeepBook adapter")?,
         )
     } else {
         warn!("DeepBook settings not provided; venue adapter disabled");
@@ -166,6 +159,7 @@ async fn run() -> Result<()> {
         checkpoint_state: None,
         admission: None,
         breakers: None,
+        reconcile_handle: None,
     };
 
     app.run().await
@@ -190,6 +184,7 @@ struct App {
     admission: Option<AdmissionControl>,
     #[allow(dead_code)]
     breakers: Option<CircuitBreakers>,
+    reconcile_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -222,6 +217,51 @@ impl App {
             );
             if let Err(err) = adapter.pool_params("SUI_USDC").await {
                 warn!(error = %err, "DeepBook pool metadata lookup failed; continuing");
+            }
+
+            if adapter.has_indexer() && !adapter.monitored_pools().is_empty() {
+                let interval = adapter.reconciliation_interval();
+                info!(
+                    pools = adapter.monitored_pools().len(),
+                    interval_secs = interval.as_secs(),
+                    "starting DeepBook open-order reconciliation"
+                );
+                let adapter_clone = adapter.clone();
+                let handle = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    loop {
+                        ticker.tick().await;
+                        match adapter_clone.reconcile_open_orders().await {
+                            Ok(discrepancies) => {
+                                if discrepancies.is_empty() {
+                                    debug!("DeepBook reconciliation run complete");
+                                } else {
+                                    for diff in discrepancies {
+                                        error!(
+                                            pool = diff.pool,
+                                            missing_on_indexer = ?diff.missing_on_indexer,
+                                            missing_on_chain = ?diff.missing_on_chain,
+                                            "DeepBook reconciliation discrepancy"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "DeepBook reconciliation iteration failed"
+                                );
+                            }
+                        }
+                    }
+                });
+                self.reconcile_handle = Some(handle);
+            } else {
+                debug!(
+                    has_indexer = adapter.has_indexer(),
+                    pools = adapter.monitored_pools().len(),
+                    "DeepBook reconciliation disabled"
+                );
             }
         }
 
@@ -325,6 +365,9 @@ impl App {
                     break;
                 }
             }
+        }
+        if let Some(handle) = self.reconcile_handle.take() {
+            handle.abort();
         }
         Ok(())
     }

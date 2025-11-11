@@ -24,3 +24,48 @@ pub static REQ_ERRORS: Lazy<CounterVec> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+pub static DEEPBOOK_CACHE_HITS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "aggr_deepbook_cache_hits_total",
+        "DeepBook metadata cache hits",
+        &["cache"]
+    )
+    .unwrap()
+});
+
+pub static DEEPBOOK_CACHE_MISSES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "aggr_deepbook_cache_misses_total",
+        "DeepBook metadata cache misses",
+        &["cache"]
+    )
+    .unwrap()
+});
+
+pub static DEEPBOOK_INDEXER_REQUESTS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "aggr_deepbook_indexer_requests_total",
+        "DeepBook indexer request outcomes",
+        &["operation", "status"]
+    )
+    .unwrap()
+});
+
+pub static DEEPBOOK_RECONCILIATION_MISMATCHES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "aggr_deepbook_reconciliation_mismatches_total",
+        "DeepBook reconciliation discrepancies",
+        &["pool", "kind"]
+    )
+    .unwrap()
+});
+
+pub static DEEPBOOK_EVENT_COUNTER: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "aggr_deepbook_events_total",
+        "DeepBook events observed within executions",
+        &["event"]
+    )
+    .unwrap()
+});

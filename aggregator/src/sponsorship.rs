@@ -281,6 +281,22 @@ impl SponsorshipManager {
             }
         }
 
+        // Check route budget
+        {
+            let mut budgets = self.route_budgets.write().await;
+            if let Some(budget) = budgets.get_mut(&req.route_plan_id) {
+                if !budget.can_spend(req.estimated_gas) {
+                    warn!(
+                        route = %req.route_plan_id,
+                        estimated_gas = req.estimated_gas,
+                        remaining = budget.remaining(),
+                        "route budget exceeded"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
         // Check gas coin availability
         {
             let gas_coins = self.gas_coins.read().await;
@@ -358,7 +374,7 @@ impl SponsorshipManager {
         let sponsor_sig_bytes = self.sign_sponsored_transaction(&tx_bcs)?;
 
         // Record spending
-        self.record_spending(sender, gas_budget).await;
+        self.apply_spending(sender, None, gas_budget).await;
 
         info!(
             user = %sender,
@@ -370,7 +386,17 @@ impl SponsorshipManager {
     }
 
     /// Record spending for a user
-    async fn record_spending(&self, user: SuiAddress, gas: u64) {
+    pub async fn apply_spending(&self, user: SuiAddress, route_class: Option<&str>, gas: u64) {
+        self.record_spending_internal(user, gas).await;
+        if let Some(route) = route_class {
+            let mut budgets = self.route_budgets.write().await;
+            if let Some(budget) = budgets.get_mut(route) {
+                budget.spend(gas);
+            }
+        }
+    }
+
+    async fn record_spending_internal(&self, user: SuiAddress, gas: u64) {
         // Update user budget
         {
             let mut budgets = self.user_budgets.write().await;

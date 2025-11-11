@@ -123,8 +123,8 @@ pub async fn validate_balance_manager_funding(
     quantized_price: f64,
     quantized_size: f64,
 ) -> Result<Option<String>> {
-    let (net_base, net_quote, net_deep) = match adapter.balance_manager_balances(&req.pool).await {
-        Ok(balances) => balances,
+    let snapshot = match adapter.balance_manager_balances(&req.pool).await {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             return Ok(Some(format!(
                 "failed to fetch balance manager balances: {}",
@@ -144,23 +144,23 @@ pub async fn validate_balance_manager_funding(
             }
         };
         let required_quote = quantized_price * quantized_size * taker_fee_multiplier;
-        if net_quote + f64::EPSILON < required_quote {
+        if snapshot.net_quote + f64::EPSILON < required_quote {
             return Ok(Some(format!(
                 "insufficient quote balance: requires {:.6}, available {:.6}",
-                required_quote, net_quote
+                required_quote, snapshot.net_quote
             )));
         }
-        if req.pay_with_deep && net_deep <= 0.0 {
+        if req.pay_with_deep && snapshot.net_deep <= 0.0 {
             return Ok(Some(
                 "pay_with_deep set but BalanceManager has no DEEP balance".to_string(),
             ));
         }
     } else {
         let required_base = quantized_size;
-        if net_base + f64::EPSILON < required_base {
+        if snapshot.net_base + f64::EPSILON < required_base {
             return Ok(Some(format!(
                 "insufficient base balance: requires {:.6}, available {:.6}",
-                required_base, net_base
+                required_base, snapshot.net_base
             )));
         }
     }
